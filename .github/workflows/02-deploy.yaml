@@ -1,0 +1,162 @@
+name: CD - Deploy to Cloud Run
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'shared/**'
+      - 'data/**'
+      - 'Dockerfile'
+      - 'requirements.txt'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy (production requires approval)'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  GCP_REGION: ${{ vars.GCP_REGION }}
+  IMAGE_NAME: gcr.io/${{ secrets.GCP_PROJECT_ID }}/healthlink
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check required secrets
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+        run: |
+          for secret in GCP_PROJECT_ID GCP_SA_KEY OPENROUTER_API_KEY PINECONE_API_KEY; do
+            if [ -z "${!secret}" ]; then
+              echo "::error::Missing secret: $secret"
+              exit 1
+            fi
+          done
+          echo "All required secrets present."
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Configure docker auth
+        run: gcloud auth configure-docker gcr.io -q
+
+      - name: Build image
+        run: |
+          docker build -t $IMAGE_NAME:${{ github.sha }} -t $IMAGE_NAME:latest .
+
+      - name: Smoke-test the image
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL || 'openai/gpt-4o-mini' }}
+          PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+          PINECONE_INDEX_NAME: ${{ vars.PINECONE_INDEX_NAME || 'healthlink' }}
+          PINECONE_DIMENSION: ${{ vars.PINECONE_DIMENSION || '1024' }}
+          EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL || 'llama-text-embed-v2' }}
+        run: |
+          docker run -d --name smoke -p 8080:8080 \
+            -e OPENROUTER_API_KEY="$OPENROUTER_API_KEY" \
+            -e OPENROUTER_MODEL="$OPENROUTER_MODEL" \
+            -e PINECONE_API_KEY="$PINECONE_API_KEY" \
+            -e PINECONE_INDEX_NAME="$PINECONE_INDEX_NAME" \
+            -e PINECONE_DIMENSION="$PINECONE_DIMENSION" \
+            -e EMBEDDING_MODEL="$EMBEDDING_MODEL" \
+            $IMAGE_NAME:${{ github.sha }}
+          echo "Waiting for container to start..."
+          sleep 20
+          echo "Container logs:"
+          docker logs smoke || echo "Container already exited"
+          echo "Testing health endpoint..."
+          curl -f http://localhost:8080/health || (docker logs smoke && exit 1)
+          docker stop smoke || true
+          docker rm smoke || true
+
+      - name: Push image to GCR
+        run: |
+          docker push $IMAGE_NAME:${{ github.sha }}
+          docker push $IMAGE_NAME:latest
+
+      - name: Determine service name
+        id: service
+        run: |
+          ENV_NAME="${{ github.event.inputs.environment || 'staging' }}"
+          echo "service=healthlink-${ENV_NAME}" >> "$GITHUB_OUTPUT"
+          if [ "$ENV_NAME" = "production" ]; then echo "load_kb=false" >> "$GITHUB_OUTPUT"; else echo "load_kb=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Build env file for Cloud Run (like local .env)
+        run: |
+          cat > /tmp/healthlink.env <<'EOF'
+          OPENROUTER_BASE_URL=${{ vars.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1' }}
+          LLM_TEMPERATURE=${{ vars.LLM_TEMPERATURE || '0.2' }}
+          LLM_MAX_TOKENS=${{ vars.LLM_MAX_TOKENS || '0' }}
+          PINECONE_CLOUD=${{ vars.PINECONE_CLOUD || 'aws' }}
+          PINECONE_REGION=${{ vars.PINECONE_REGION || 'us-east-1' }}
+          PINECONE_METRIC=${{ vars.PINECONE_METRIC || 'cosine' }}
+          RAG_TOP_K=${{ vars.RAG_TOP_K || '5' }}
+          CHUNK_SIZE=${{ vars.CHUNK_SIZE || '500' }}
+          CHUNK_OVERLAP=${{ vars.CHUNK_OVERLAP || '50' }}
+          DATABASE_URL=${{ vars.DATABASE_URL || 'sqlite:///./data/healthlink.db' }}
+          DB_ECHO=${{ vars.DB_ECHO || 'false' }}
+          DB_POOL_SIZE=${{ vars.DB_POOL_SIZE || '10' }}
+          DB_MAX_OVERFLOW=${{ vars.DB_MAX_OVERFLOW || '20' }}
+          DB_POOL_RECYCLE_SECONDS=${{ vars.DB_POOL_RECYCLE_SECONDS || '1800' }}
+          LOG_LEVEL=${{ vars.LOG_LEVEL || 'INFO' }}
+          ENABLE_METRICS=${{ vars.ENABLE_METRICS || 'true' }}
+          LANGCHAIN_TRACING_V2=${{ vars.LANGCHAIN_TRACING_V2 || 'false' }}
+          LANGCHAIN_API_KEY=${{ secrets.LANGCHAIN_API_KEY || '' }}
+          LANGCHAIN_PROJECT=${{ vars.LANGCHAIN_PROJECT || 'healthlink' }}
+          SECRET_KEY=${{ secrets.SECRET_KEY || 'dev-secret-key-change-in-production' }}
+          RATE_LIMIT_MAX=${{ vars.RATE_LIMIT_MAX || '0' }}
+          RATE_LIMIT_WINDOW=${{ vars.RATE_LIMIT_WINDOW || '60' }}
+          CORS_ORIGINS=${{ vars.CORS_ORIGINS || '*' }}
+          API_BASE_URL=${{ vars.API_BASE_URL || 'http://localhost:8080/api/v1' }}
+          CLOUD_RUN_URL=${{ vars.CLOUD_RUN_URL || '' }}
+          CLOUD_RUN_API_URL=${{ vars.CLOUD_RUN_API_URL || '' }}
+          KB_FILE=${{ vars.KB_FILE || './data/symptoms_kb.json' }}
+          DOCTORS_CSV=${{ vars.DOCTORS_CSV || './data/doctors.csv' }}
+          OPENROUTER_API_KEY=${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL=${{ vars.OPENROUTER_MODEL || 'openai/gpt-4o-mini' }}
+          PINECONE_API_KEY=${{ secrets.PINECONE_API_KEY }}
+          PINECONE_INDEX_NAME=${{ vars.PINECONE_INDEX_NAME || 'healthlink' }}
+          PINECONE_DIMENSION=${{ vars.PINECONE_DIMENSION || '1024' }}
+          EMBEDDING_MODEL=${{ vars.EMBEDDING_MODEL || 'llama-text-embed-v2' }}
+          LOAD_KB_ON_STARTUP=${{ steps.service.outputs.load_kb }}
+          EOF
+          cat /tmp/healthlink.env
+
+      - name: Deploy to Cloud Run
+        id: deploy
+        run: |
+          gcloud run deploy ${{ steps.service.outputs.service }} \
+            --image $IMAGE_NAME:${{ github.sha }} \
+            --region $GCP_REGION \
+            --platform managed \
+            --allow-unauthenticated \
+            --min-instances 0 --max-instances 2 \
+            --port 8080 \
+            --env-vars-file /tmp/healthlink.env
+
+      - name: Health check (public)
+        run: |
+          URL=$(gcloud run services describe ${{ steps.service.outputs.service }} \
+            --region $GCP_REGION --format 'value(status.url)')
+          echo "Deployed to: $URL"
+          sleep 20
+          curl -f "$URL/health"
+          curl -f "$URL/docs" -o /dev/null
